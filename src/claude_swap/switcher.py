@@ -25,6 +25,10 @@ from claude_swap import oauth
 from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_API_KEY,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+    USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
     usage_fields,
@@ -32,7 +36,9 @@ from claude_swap.json_output import (
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
+    ActiveCredentials,
     CredentialStore,
+    looks_like_api_key,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -152,6 +158,12 @@ class ClaudeAccountSwitcher:
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
+
+        # Set by _build_accounts_info: True when the active account's OAuth
+        # credential could not be read because the macOS Keychain was unavailable
+        # (locked / denied / timeout) with no fallback — so the usage row shows
+        # "keychain unavailable" instead of a misleading "no credentials".
+        self._active_keychain_unavailable = False
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -280,6 +292,9 @@ class ClaudeAccountSwitcher:
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
+
+    def _read_active_credentials(self) -> ActiveCredentials:
+        return self._store._read_active_credentials()
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
@@ -567,6 +582,61 @@ class ClaudeAccountSwitcher:
             return False
         return self._find_account_slot(data, email, organization_uuid) is not None
 
+    def _account_kind(self, account_num: str | None) -> str:
+        """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
+
+        Slots added before this field existed have no ``kind`` and read as
+        ``"oauth"`` (back-compat).
+        """
+        if account_num is None:
+            return "oauth"
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        return "api_key" if record.get("kind") == "api_key" else "oauth"
+
+    def _reject_live_api_key_capture(self, creds: str) -> None:
+        """Guard for ``add_account``: never capture a live managed key as OAuth.
+
+        ``add_account`` snapshots the *live* active credential under an
+        ``oauthAccount`` identity. Now that ``_read_credentials`` can return a raw
+        ``sk-ant-api…`` key, a live ``/login`` key could be backed up as a kindless
+        account, corrupting the session-guard / export / collision logic that keys
+        off ``kind``. Reject with guidance toward the supported path instead.
+        """
+        if looks_like_api_key(creds):
+            raise ValidationError(
+                "Active login is an API-key account. Add it with "
+                "'cswap --add-token sk-ant-api...' instead of --add-account."
+            )
+
+    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+        """Reject registering a token whose (email, personal-org) already exists as
+        the *other* kind.
+
+        Identity is matched on ``(email, organizationUuid)`` only, so two slots
+        sharing an email across kinds (one OAuth, one API key) could not be told
+        apart at switch time. Rather than thread ``kind`` through the whole identity
+        system, refuse the collision and point the user at a distinct ``--email``.
+        The default ``…@token.local`` labels never collide; this only guards a forced
+        ``--email``.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return
+        slot = self._find_account_slot(data, email, "")
+        if slot is None:
+            return
+        existing_kind = self._account_kind(slot)
+        new_kind = "api_key" if is_api_key else "oauth"
+        if existing_kind != new_kind:
+            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
+            new_label = "API-key" if is_api_key else "OAuth"
+            raise ValidationError(
+                f"'{email}' already exists as an {existing_label} account "
+                f"(slot {slot}); cannot add it as an {new_label} account. "
+                f"Pass a distinct --email."
+            )
+
     @staticmethod
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
         """Return display tag for an account's org context."""
@@ -708,6 +778,7 @@ class ClaudeAccountSwitcher:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
+            self._reject_live_api_key_capture(current_creds)
 
             config_path = self._get_claude_config_path()
             try:
@@ -785,6 +856,7 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
+        self._reject_live_api_key_capture(current_creds)
 
         config_path = self._get_claude_config_path()
         try:
@@ -848,18 +920,21 @@ class ClaudeAccountSwitcher:
     def add_account_from_token(
         self, token: str, email: str | None = None, slot: int | None = None
     ) -> None:
-        """Register a raw OAuth setup-token as a new account.
+        """Register a raw OAuth setup-token or managed API key as a new account.
 
         Useful for headless servers or when the token is received from another
-        machine, without needing a prior Claude Code login on this machine.
-        No Anthropic API calls are made.
+        machine, without needing a prior Claude Code login on this machine. The
+        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis), anything else is
+        treated as an OAuth setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth access token, or ``"-"`` to read one line from
-                   stdin, or ``""`` to prompt securely via getpass.
+            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+                   one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
-                   defaults to ``setup-token-{slot}@token.local`` since
-                   setup-tokens carry no real email metadata.
+                   defaults to ``setup-token-{slot}@token.local`` (or
+                   ``api-key-{slot}@token.local`` for API keys) since these tokens
+                   carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
         """
         import getpass
@@ -867,11 +942,13 @@ class ClaudeAccountSwitcher:
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
         elif not token:
-            token = getpass.getpass("Setup token: ")
+            token = getpass.getpass("Token: ")
 
         token = token.strip()
         if not token:
             raise ValidationError("Token cannot be empty")
+
+        is_api_key = looks_like_api_key(token)
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
@@ -880,13 +957,40 @@ class ClaudeAccountSwitcher:
         self._init_sequence_file()
         self._migrate_org_fields()
 
-        # Synthesize a placeholder email when one isn't provided. Setup-tokens
+        # Synthesize a placeholder email when one isn't provided. These tokens
         # have no real email metadata, so requiring users to invent one is
         # noise; the slot number gives every default account a unique key.
         if not email:
             if slot is None:
                 slot = self._get_next_account_number()
-            email = f"setup-token-{slot}@token.local"
+            label = "api-key" if is_api_key else "setup-token"
+            email = f"{label}-{slot}@token.local"
+
+        # Don't silently overwrite/convert an existing account of the other kind:
+        # identity is matched on (email, org) only, so an api-key and an OAuth
+        # account sharing an email would be indistinguishable at switch time.
+        self._reject_cross_kind_collision(email, is_api_key)
+
+        # Build the credential payload by kind: a managed key is stored raw; an
+        # OAuth setup-token is wrapped in Claude Code's credential JSON. The
+        # synthesized config is identical for both (no real org metadata).
+        if is_api_key:
+            credentials = token
+        else:
+            credentials = json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": token,
+                    "scopes": list(SETUP_TOKEN_SCOPES),
+                }
+            })
+        config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
@@ -896,27 +1000,14 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            credentials = json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": token,
-                    "scopes": list(SETUP_TOKEN_SCOPES),
-                }
-            })
-            config = json.dumps({
-                "oauthAccount": {
-                    "emailAddress": email,
-                    "accountUuid": "",
-                    "organizationUuid": None,
-                    "organizationName": None,
-                }
-            })
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
-            self._logger.info(f"Updated token for account {account_num}: {email}")
+            kind_label = "API key" if is_api_key else "token"
+            self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
-                f"{accent('Updated token')} for Account {account_num} "
+                f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
             return
@@ -962,21 +1053,6 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        credentials = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": token,
-                "scopes": list(SETUP_TOKEN_SCOPES),
-            }
-        })
-        config = json.dumps({
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        })
-
         if displace_slot:
             d_num, d_email = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -1000,27 +1076,35 @@ class ClaudeAccountSwitcher:
         self._write_account_config(account_num, email, config)
 
         data = self._get_sequence_data()
-        data["accounts"][account_num] = {
+        record = {
             "email": email,
             "uuid": "",
             "organizationUuid": "",
             "organizationName": "",
             "added": get_timestamp(),
         }
+        if is_api_key:
+            record["kind"] = "api_key"
+        data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Added account {account_num} from token: {email}")
+        source_label = "API key" if is_api_key else "token"
+        self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
-            f"{muted('[personal]')} {muted('(from token)')}"
+            f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
-    def remove_account(self, identifier: str) -> None:
-        """Remove account from managed accounts."""
+    def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
+        """Remove account from managed accounts.
+
+        When ``assume_yes`` is True the confirmation prompt is skipped (used by
+        the TUI, which collects confirmation before calling).
+        """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1076,13 +1160,14 @@ class ClaudeAccountSwitcher:
         if str(active_account) == account_num:
             warning(f"Warning: Account-{account_num} ({email}) is currently active")
 
-        confirm = input(
-            f"Are you sure you want to permanently remove "
-            f"Account-{account_num} ({email})? [y/N] "
-        )
-        if confirm.lower() != "y":
-            print(dimmed("Cancelled"))
-            return
+        if not assume_yes:
+            confirm = input(
+                f"Are you sure you want to permanently remove "
+                f"Account-{account_num} ({email})? [y/N] "
+            )
+            if confirm.lower() != "y":
+                print(dimmed("Cancelled"))
+                return
 
         # Remove backup files
         self._delete_account_files(account_num, email)
@@ -1114,6 +1199,10 @@ class ClaudeAccountSwitcher:
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str]] = []
+        # Reset each build; set below only when the active slot's OAuth Keychain
+        # read failed with no fallback. Read by _collect_usage.fetch (main thread
+        # writes it here before the fetch pool starts → no data race).
+        self._active_keychain_unavailable = False
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -1122,12 +1211,114 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                creds = self._read_credentials() or ""
+                active = self._read_active_credentials()
+                creds = active.value or ""
+                self._active_keychain_unavailable = active.keychain_unavailable
             else:
                 creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
         return accounts_info
+
+    def _active_cc_running(self) -> bool:
+        """Whether any default-profile Claude Code instance is running.
+
+        Fails closed: if instance detection raises, assume an owner may exist so we
+        never refresh the live credential out from under a running Claude Code.
+        """
+        try:
+            sessions, ides = get_running_instances()
+            return bool(sessions or ides)
+        except Exception:
+            self._logger.debug("Failed to detect running Claude instances", exc_info=True)
+            return True
+
+    def _fetch_active_usage(
+        self, account_num: str, email: str, creds: str
+    ) -> dict | str | None:
+        """Usage for the active/default account, refreshing its token only when safe.
+
+        The active credential is the one Claude Code concurrently owns, so cswap
+        normally leaves it alone (issue #62). But when no *owner* is detected —
+        neither a default-profile Claude Code (``_active_cc_running``) nor a live
+        ``cswap run`` session for this same account (``_live_session_pids``) — there
+        is no concurrent refresher, so an expired token can be refreshed and written
+        back to the **active** store (Claude Code reads the rotated credential on its
+        next start).
+
+        When an owner *is* present and the token is expired, returns the
+        ``USAGE_TOKEN_EXPIRED`` sentinel so the UI shows an intentional line rather
+        than a bare "usage unavailable".
+        """
+        oauth_data = oauth.extract_oauth_data(creds)
+        if not oauth_data or not oauth_data.get("accessToken"):
+            return USAGE_NO_CREDENTIALS
+
+        owned = self._active_cc_running() or bool(
+            self._live_session_pids(account_num, email)
+        )
+        if owned:
+            usage = oauth.fetch_usage_for_account(
+                account_num, email, creds, is_active=True,
+            )
+            if usage is None and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+                return USAGE_TOKEN_EXPIRED
+            return usage
+
+        # No owner detected → safe to refresh the active token. Reuse the inactive
+        # refresh machinery (proactive refresh + 401 retry), persisting the rotated
+        # credential to BOTH the active store and the backup. Do NOT hold the lock
+        # across the network refresh: FileLock is non-reentrant and persist_active
+        # re-acquires it (regressing commit a07c767 would deadlock and silently drop
+        # the refreshed token).
+        original_refresh = oauth_data.get("refreshToken")
+        persist_skipped = False
+
+        def persist_active(num: str, acct_email: str, new_creds: str) -> None:
+            nonlocal persist_skipped
+            with FileLock(self.lock_file):
+                live = self._read_credentials() or ""
+                live_oauth = oauth.extract_oauth_data(live) if live else None
+                live_refresh = live_oauth.get("refreshToken") if live_oauth else None
+                # Re-check owners + refresh-token lineage under the lock. If a Claude
+                # Code / session appeared, or an external write (e.g. a user /login)
+                # replaced the credential since we read it, skip rather than clobber a
+                # live process's newer credential. Best effort, not perfectly atomic.
+                if (
+                    self._active_cc_running()
+                    or self._live_session_pids(num, acct_email)
+                    or live_refresh != original_refresh
+                ):
+                    persist_skipped = True
+                    self._logger.warning(
+                        "Active-account refresh for %s (%s): owner appeared or refresh "
+                        "token changed mid-refresh; discarding rotated credential.",
+                        num, acct_email,
+                    )
+                    return
+                # A write failure leaves the live store holding the now-consumed
+                # original refresh token, so mark the persist as skipped (never show
+                # usage for it) and re-raise — oauth._persist swallows the exception
+                # but logs its "failed to persist" warning first.
+                try:
+                    self._write_credentials(new_creds)  # active store — Claude Code reads this
+                    self._write_account_credentials(num, acct_email, new_creds)  # backup in sync
+                except Exception:
+                    persist_skipped = True
+                    raise
+
+        usage = oauth.fetch_usage_for_account(
+            account_num, email, creds,
+            is_active=False, persist_credentials=persist_active,
+        )
+        # If we refreshed but discarded the rotated credential, never show usage for
+        # a credential we didn't keep — surface the expired state and let Claude Code
+        # settle it.
+        if persist_skipped:
+            return USAGE_TOKEN_EXPIRED
+        if usage is None and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            return USAGE_TOKEN_EXPIRED
+        return usage
 
     def _collect_usage(
         self, accounts_info: list[tuple[int, str, str, str, bool, str]]
@@ -1143,8 +1334,19 @@ class ClaudeAccountSwitcher:
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
             num, email, _, _, is_active, creds = account_info
+            if looks_like_api_key(creds):
+                # Managed API-key account: no subscription quota to fetch.
+                return USAGE_API_KEY
             if not creds or not oauth.extract_access_token(creds):
-                return "no credentials"
+                if is_active and self._active_keychain_unavailable:
+                    return USAGE_KEYCHAIN_UNAVAILABLE
+                return USAGE_NO_CREDENTIALS
+
+            # The active/default account owns the live credential — route it through
+            # the owner-aware path that refreshes only when no Claude Code/session is
+            # running and writes the rotated credential back to the active store.
+            if is_active:
+                return self._fetch_active_usage(str(num), email, creds)
 
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
                 with FileLock(self.lock_file):
@@ -1160,7 +1362,7 @@ class ClaudeAccountSwitcher:
 
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
-                is_active=is_active or has_live_session,
+                is_active=has_live_session,
                 persist_credentials=persist,
             )
 
@@ -1306,7 +1508,13 @@ class ClaudeAccountSwitcher:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
             else:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}")
-            if isinstance(usage, str):
+            if usage == USAGE_TOKEN_EXPIRED:
+                print(f"     {dimmed('token expired — Claude Code refreshes the active account')}")
+            elif usage == USAGE_API_KEY:
+                print(f"     {dimmed('API key (no quota)')}")
+            elif usage == USAGE_KEYCHAIN_UNAVAILABLE:
+                print(f"     {dimmed('keychain unavailable — locked or in use; try again')}")
+            elif isinstance(usage, str):
                 print(f"     {dimmed(usage)}")
             elif usage is None:
                 print(f"     {dimmed('usage unavailable')}")
@@ -1361,23 +1569,28 @@ class ClaudeAccountSwitcher:
     ) -> dict | str | None:
         """Usage for the active account as a ``_collect_usage``-style entry.
 
-        Returns ``"no credentials"`` when the live store has no usable token, a
-        usage dict on success, or ``None`` when the fetch fails. Reuses (and
-        refreshes) the same ``cache/usage.json`` list_accounts writes — cache-first,
-        fetching with ``is_active=True`` so cswap never refreshes Claude Code's live
-        credentials, and merging into existing entries so other rows survive.
+        Returns ``USAGE_NO_CREDENTIALS`` when the live store has no usable token,
+        ``USAGE_KEYCHAIN_UNAVAILABLE`` when the OAuth Keychain read failed with no
+        fallback, a usage dict on success, ``USAGE_TOKEN_EXPIRED`` when the token is
+        expired and Claude Code owns it, or ``None`` when the fetch fails. Reuses the
+        same ``cache/usage.json`` list_accounts writes — cache-first — and delegates
+        the owner-aware refresh decision to ``_fetch_active_usage``.
         """
-        creds = self._read_credentials() or ""
+        active = self._read_active_credentials()
+        creds = active.value or ""
+        if looks_like_api_key(creds):
+            # Managed API-key account: no subscription quota to fetch.
+            return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
-            return "no credentials"
+            if active.keychain_unavailable:
+                return USAGE_KEYCHAIN_UNAVAILABLE
+            return USAGE_NO_CREDENTIALS
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
         if (cached is not MISSING and isinstance(cached, dict)
                 and account_num in cached):
             return cached[account_num]
-        usage = oauth.fetch_usage_for_account(
-            account_num, current_email, creds, is_active=True,
-        )
+        usage = self._fetch_active_usage(account_num, current_email, creds)
         existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
         existing[account_num] = usage
         write_cache(usage_cache_path, existing)
@@ -1460,6 +1673,12 @@ class ClaudeAccountSwitcher:
                 for j, line in enumerate(lines):
                     connector = "└" if j == len(lines) - 1 else "├"
                     print(f"  {dimmed(connector)} {muted(line)}")
+            elif usage == USAGE_TOKEN_EXPIRED:
+                print(f"  {dimmed('token expired — Claude Code refreshes the active account')}")
+            elif usage == USAGE_API_KEY:
+                print(f"  {dimmed('API key (no quota)')}")
+            elif usage == USAGE_KEYCHAIN_UNAVAILABLE:
+                print(f"  {dimmed('keychain unavailable — locked or in use; try again')}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
