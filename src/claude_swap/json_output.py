@@ -8,6 +8,10 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from claude_swap import oauth
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
@@ -26,14 +30,25 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 
 
 def _window_to_json(entry: dict) -> dict:
-    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``."""
+    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``.
+
+    ``countdown``/``clock`` are recomputed from ``resets_at`` at serialization
+    time (the store may serve a measurement hours after its fetch); entries
+    without ``resets_at`` fall back to the fetch-time strings.
+    """
     out: dict = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
-    if "countdown" in entry:
-        out["countdown"] = entry["countdown"]
-    if "clock" in entry:
-        out["clock"] = entry["clock"]
+    cell = oauth.fresh_reset_strings(entry)
+    if cell:
+        out["countdown"], out["clock"] = cell
+    return out
+
+
+def _scoped_window_to_json(entry: dict) -> dict:
+    """Project a per-model scoped weekly window, carrying its model name."""
+    out = _window_to_json(entry)
+    out["name"] = entry["name"]
     return out
 
 
@@ -58,11 +73,12 @@ def usage_to_json(usage: dict) -> dict:
         }
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
-        if "countdown" in spend:
-            spend_out["countdown"] = spend["countdown"]
-        if "clock" in spend:
-            spend_out["clock"] = spend["clock"]
+        cell = oauth.fresh_reset_strings(spend)
+        if cell:
+            spend_out["countdown"], spend_out["clock"] = cell
         out["spend"] = spend_out
+    if "scoped" in usage:
+        out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]
     return out
 
 
@@ -93,6 +109,26 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
+def usage_freshness_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
+    old the served ``usage`` measurement is (the store may serve last-good
+    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    if fetched_at is None:
+        return {}
+    fields: dict = {
+        "usageFetchedAt": (
+            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    }
+    if age_s is not None:
+        fields["usageAgeSeconds"] = round(age_s, 1)
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -100,10 +136,13 @@ def account_row(
     org_uuid: str,
     active: bool,
     usage_entry: dict | str | None,
+    *,
+    usage_fetched_at: float | None = None,
+    usage_age_s: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
-    return {
+    row = {
         "number": number,
         "email": email,
         "organizationName": org_name,
@@ -113,6 +152,9 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if usage is not None:
+        row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    return row
 
 
 def error_envelope(exc: Exception) -> dict:

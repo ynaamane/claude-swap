@@ -8,13 +8,81 @@ import os
 import sys
 
 from claude_swap import __version__
-from claude_swap.auto_switch import AutoSwitcher, load_config as _as_load_config, save_config as _as_save_config
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.launchd import agent_status, install_agent, uninstall_agent
-from claude_swap.models import Platform
 from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
+
+
+def _prog_name() -> str:
+    """The command name to show in usage/help.
+
+    argparse otherwise defaults to ``os.path.basename(sys.argv[0])``, which for
+    an installed entry-point shim renders as an ugly absolute path (e.g.
+    ``python.exe C:\\Users\\me\\.local\\bin\\cswap``). We strip that down to the
+    bare command the user typed (``cswap`` / ``claude-swap``), falling back to
+    ``cswap`` for ``python -m claude_swap`` and odd launchers.
+    """
+    name = os.path.basename(sys.argv[0] or "")
+    for ext in (".exe", ".pyw", ".py"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    if not name or name in {"__main__", "python", "python3", "py"}:
+        return "cswap"
+    return name
+
+
+# Memorable subcommand aliases → the long-standing flags they expand to. Lets
+# users type `cswap list`, `cswap status`, `cswap add`, etc. instead of `--list`
+# / `--status` / `--add-account`, which all still work. `switch` is special-cased
+# below (a bare `switch` rotates; `switch <target>` jumps to one account) and
+# `run`/`auto` keep their own pre-dispatch parsers, so none of those are listed here.
+_SUBCOMMAND_FLAGS = {
+    "help": "--help",
+    "list": "--list",
+    "ls": "--list",
+    "status": "--status",
+    "add": "--add-account",
+    "add-token": "--add-token",
+    "remove": "--remove-account",
+    "rm": "--remove-account",
+    "export": "--export",
+    "import": "--import",
+    "purge": "--purge",
+    "upgrade": "--upgrade",
+    "update": "--upgrade",
+    "tui": "--tui",
+    "watch": "--watch",
+}
+
+
+def _translate_subcommand(argv: list[str]) -> list[str]:
+    """Rewrite a leading memorable subcommand into the equivalent flag argv.
+
+    ``argv`` is the args after the program name. The rewrite only fires when the
+    first token is a recognized verb (which never starts with '-'), so the
+    established ``--flag`` interface — and every existing test that drives it —
+    is left untouched. Tokens after the verb pass through verbatim, so flags
+    like ``--json``, ``--strategy``, ``--slot``, and ``--force`` keep combining
+    exactly as before (e.g. ``cswap switch --strategy best``, ``cswap list --json``).
+    """
+    if not argv:
+        return argv
+
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "switch":
+        # Bare `switch` rotates; `switch <num|email>` jumps to that account.
+        if rest and not rest[0].startswith("-"):
+            return ["--switch-to", *rest]
+        return ["--switch", *rest]
+
+    flag = _SUBCOMMAND_FLAGS.get(verb)
+    if flag is not None:
+        return [flag, *rest]
+
+    return argv
 
 
 def _run_command(argv: list[str]) -> None:
@@ -38,7 +106,7 @@ def _run_command(argv: list[str]) -> None:
         head, tail = argv, []
 
     parser = argparse.ArgumentParser(
-        prog="cswap run",
+        prog=f"{_prog_name()} run",
         description=(
             "[EXPERIMENTAL] Launch Claude Code as a stored account in this "
             "terminal only (the default login and other terminals are "
@@ -50,6 +118,7 @@ Examples:
   cswap run 2
   cswap run user@example.com
   cswap run 2 --no-share
+  cswap run 2 --share-history
   cswap run 2 -- --resume
         """,
     )
@@ -65,6 +134,18 @@ Examples:
             "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
             "from ~/.claude into the session profile (and remove previously "
             "shared items)"
+        ),
+    )
+    parser.add_argument(
+        "--share-history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Share conversation history (projects/ and history.jsonl) from "
+            "~/.claude into the session profile, so every account sees one "
+            "unified history. History the profile already accumulated is "
+            "merged into ~/.claude first. --no-share-history restores "
+            "per-account history (the default). Not supported on Windows."
         ),
     )
     parser.add_argument(
@@ -84,7 +165,12 @@ Examples:
 
         from claude_swap.session import SessionManager
 
-        SessionManager(switcher).run(args.account, tail, share=not args.no_share)
+        SessionManager(switcher).run(
+            args.account,
+            tail,
+            share=not args.no_share,
+            share_history=args.share_history,
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -93,297 +179,392 @@ Examples:
         sys.exit(130)
 
 
-def _fmt_clock_ago(ts: float) -> str:
-    """Render a wall-clock POSIX ts as ``HH:MM (Nm ago)`` in local time."""
-    from datetime import datetime, timezone
-
-    try:
-        dt_local = datetime.fromtimestamp(ts).astimezone()
-        delta = datetime.now(timezone.utc).timestamp() - ts
-        mins = max(0, int(delta // 60))
-        if mins >= 60:
-            ago = f"{mins // 60}h {mins % 60}m ago"
-        else:
-            ago = f"{mins}m ago"
-        return f"{dt_local.strftime('%H:%M')} ({ago})"
-    except Exception:
-        return "unknown"
-
-
-def _monitoring_status_line(backup_root) -> str:
-    """One-line monitoring health for ``cswap auto status`` (offline-aware).
-
-    Only renders "offline" once we've actually DECLARED offline
-    (``offline_notified`` — i.e. >= 2 consecutive failures, matching the
-    notification gate). A single transient failure that hasn't yet crossed the
-    threshold renders as "checking — retrying", so the UI word "offline" lines
-    up with when the engine truly considers itself offline.
-    """
-    from claude_swap.auto_switch_state import load_state
-
-    state = load_state(backup_root)
-    if state.offline_notified:
-        if state.last_online_ts is not None:
-            return f"offline since {_fmt_clock_ago(state.last_online_ts)}"
-        return "offline (never reached the usage API)"
-    if 0 < state.consecutive_failures < 2:
-        n = state.consecutive_failures
-        return f"checking — {n} failed check{'s' if n != 1 else ''}, retrying"
-    if state.last_online_ts is not None:
-        return f"online (last check {_fmt_clock_ago(state.last_online_ts)})"
-    return "online (no check yet)"
-
-
-def _last_switch_status_line(backup_root) -> str | None:
-    """``account-X at HH:MM (reason)`` from state, or None when never switched."""
-    from claude_swap.auto_switch_state import load_state
-
-    state = load_state(backup_root)
-    sw = state.last_switch
-    if not isinstance(sw, dict) or "account" not in sw:
-        return None
-    acct = sw.get("account")
-    reason = sw.get("reason", "")
-    ts = sw.get("ts")
-    when = _fmt_clock_ago(ts) if isinstance(ts, (int, float)) else "unknown"
-    return f"account-{acct} at {when} ({reason})"
-
-
-def _last_usage_status_lines(backup_root) -> list[str]:
-    """Per-account last-known 5h/7d% (with age) from monitor state.
-
-    Renders the ``last_usage`` the daemon records each tick — clearly labelled
-    as last-known (the daemon probes only the active account most ticks, so a
-    peer's reading can be older). Empty when nothing has been recorded yet.
-    """
-    from claude_swap.auto_switch_state import load_state
-
-    state = load_state(backup_root)
-    if not isinstance(state.last_usage, dict) or not state.last_usage:
-        return []
-
-    def _pct(usage: dict, key: str):
-        w = usage.get(key) if isinstance(usage, dict) else None
-        if isinstance(w, dict) and isinstance(w.get("pct"), (int, float)):
-            return float(w["pct"])
-        return None
-
-    lines: list[str] = []
-    for num in sorted(state.last_usage, key=lambda n: (len(n), n)):
-        entry = state.last_usage[num]
-        if not isinstance(entry, dict):
-            continue
-        usage = entry.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        h5 = _pct(usage, "five_hour")
-        d7 = _pct(usage, "seven_day")
-        h5_s = f"5h {h5:.0f}%" if h5 is not None else "5h —"
-        d7_s = f"7d {d7:.0f}%" if d7 is not None else "7d —"
-        fetched_at = entry.get("fetched_at")
-        age = (
-            _fmt_clock_ago(fetched_at)
-            if isinstance(fetched_at, (int, float))
-            else "unknown"
-        )
-        lines.append(f"  acct {num}: {h5_s}  {d7_s}  (last-known {age})")
-    return lines
-
-
 def _auto_command(argv: list[str]) -> None:
-    """Handle ``cswap auto [on|off|status]``, ``cswap watch``, ``cswap _auto-daemon``.
+    """Handle `cswap auto [--once] [--json] [...]`.
 
-    Pre-dispatched before the main argparse parser so these subcommands can
-    coexist with the existing required mutually-exclusive group.
+    Pre-dispatched before the main parser is built, like `run` (and with the
+    same limitation: `auto` must be the first argument). Runs the auto-switch
+    engine — a foreground loop by default, or a single evaluate-and-maybe-
+    switch tick with --once whose exit code reports the outcome (for cron/
+    systemd timers): 0 switched, 1 error, 2 no action needed, 3 blocked
+    (no viable target / all accounts exhausted).
     """
-    from dataclasses import replace as _replace
+    import signal
+    import time as _time
 
-    from claude_swap.auto_switch import AutoSwitchConfig  # noqa: F401 — for type hints
+    parser = argparse.ArgumentParser(
+        prog="cswap auto",
+        description=(
+            "Automatically switch accounts when the active one nears its "
+            "5h/7d rate limit. Runs a foreground polling loop; use --once "
+            "for a single tick (cron-friendly)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exit codes with --once:
+  0  switched to another account
+  1  error (network trouble, lock contention, ...)
+  2  no action needed
+  3  blocked: wanted to switch but no viable target / all exhausted
 
-    verb = argv[0] if argv else "auto"
+Examples:
+  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto --threshold 80        # switch earlier
+  cswap auto --json                # one JSON event per line (for scripts)
+  cswap auto --once; echo $?       # single tick, outcome in exit code
+  cswap auto --dry-run             # log decisions, never actually switch
 
-    # Hidden daemon entry point (launchd calls this).
-    if verb == "_auto-daemon":
-        try:
-            switcher = ClaudeAccountSwitcher()
-            config = _as_load_config(switcher.backup_dir)
-            AutoSwitcher(switcher, config).run_daemon()
-        except Exception as exc:
-            error(f"Error: auto-switch daemon: {exc}")
-            sys.exit(1)
-        return
-
-    # Foreground watch loop.
-    if verb == "watch":
-        parser = argparse.ArgumentParser(prog="cswap watch")
-        parser.add_argument("--session-threshold", type=float, metavar="N")
-        parser.add_argument("--weekly-threshold", type=float, metavar="N")
-        parser.add_argument("--no-notify", action="store_true")
-        parser.add_argument(
-            "--strategy", choices=["reactive", "consume-first"],
-            metavar="{reactive,consume-first}",
-        )
-        args = parser.parse_args(argv[1:])
-
-        if Platform.detect() is not Platform.MACOS:
-            print(dimmed(
-                "Auto-switch watch is a macOS-only feature for now.\n"
-                "The decision engine and tests run on all platforms."
-            ))
-            sys.exit(0)
-
-        try:
-            switcher = ClaudeAccountSwitcher()
-            config = _as_load_config(switcher.backup_dir)
-            overrides: dict = {}
-            if args.session_threshold is not None:
-                overrides["session_threshold"] = args.session_threshold
-            if args.weekly_threshold is not None:
-                overrides["weekly_threshold"] = args.weekly_threshold
-            if args.no_notify:
-                overrides["notify"] = False
-            if args.strategy is not None:
-                overrides["strategy"] = args.strategy
-            if overrides:
-                config = _replace(config, **overrides)
-
-            AutoSwitcher(switcher, config).watch()
-        except Exception as exc:
-            error(f"Error: {exc}")
-            sys.exit(1)
-        return
-
-    # cswap auto [on|off|status]
-    parser = argparse.ArgumentParser(prog="cswap auto")
-    parser.add_argument(
-        "subverb",
-        nargs="?",
-        choices=["on", "off", "status"],
-        default="status",
+Defaults live in settings.json in the backup root; flags override them.
+        """,
     )
-    parser.add_argument("--session-threshold", type=float, metavar="N")
-    parser.add_argument("--weekly-threshold", type=float, metavar="N")
-    parser.add_argument("--no-notify", action="store_true")
     parser.add_argument(
-        "--strategy", choices=["reactive", "consume-first"],
-        metavar="{reactive,consume-first}",
+        "--once",
+        action="store_true",
+        help="Evaluate once, maybe switch, and exit (exit code = outcome)",
     )
-    args = parser.parse_args(argv[1:])
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one machine-readable JSON event per line on stdout",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        metavar="SECONDS",
+        help="Poll interval in loop mode (min 15; default 60)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Switch when the active account's binding 5h/7d window reaches "
+            "this utilization (50-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        metavar="SECONDS",
+        help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--include-api-key-accounts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Allow switching onto managed API-key accounts as a last resort "
+            "(they bill per token; default: excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Evaluate and report, but never switch or write state",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args(argv)
+
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.printer import accent, yellowed
+    from claude_swap.settings import load_settings, merged_with_cli
+
+    def jsonl_emit(event: AutoSwitchEvent) -> None:
+        print(json.dumps(event.to_json()), flush=True)
+
+    def human_emit(event: AutoSwitchEvent) -> None:
+        stamp = _time.strftime("%H:%M:%S")
+        line = event.human()
+        if event.kind == "switch":
+            line = accent(line)
+        elif event.kind in ("error", "account-quarantined"):
+            line = yellowed(line)
+        elif event.kind in ("poll", "no-switch", "sleep"):
+            line = dimmed(line)
+        print(f"{stamp}  {line}", flush=True)
 
     try:
-        switcher = ClaudeAccountSwitcher()
-        backup_root = switcher.backup_dir
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
 
-        if args.subverb == "on":
-            # New install (no config file yet) defaults to the proactive
-            # consume-first policy; an existing config keeps its strategy unless
-            # --strategy overrides it.
-            config_existed = (backup_root / "auto-switch.json").exists()
-            config = _as_load_config(backup_root)
-            overrides_on: dict = {"enabled": True}
-            if args.session_threshold is not None:
-                overrides_on["session_threshold"] = args.session_threshold
-            if args.weekly_threshold is not None:
-                overrides_on["weekly_threshold"] = args.weekly_threshold
-            if args.no_notify:
-                overrides_on["notify"] = False
-            if args.strategy is not None:
-                overrides_on["strategy"] = args.strategy
-            elif not config_existed:
-                overrides_on["strategy"] = "consume-first"
-            config = _replace(config, **overrides_on)
-            _as_save_config(config, backup_root)
-            # Normal-visibility disclosure: a new install silently defaults to
-            # consume-first (and a purge-then-on can flip an existing user), so
-            # the active strategy must be plainly shown, not dimmed.
-            print(f"Auto-switch enabled (strategy: {config.strategy}).")
+        settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        engine = AutoSwitchEngine(
+            switcher,
+            settings,
+            jsonl_emit if args.json else human_emit,
+            dry_run=args.dry_run,
+        )
 
-            if Platform.detect() is Platform.MACOS:
-                msg = install_agent(backup_root)
-                print(msg)
-            else:
-                print(dimmed(
-                    "Auto-switch daemon is macOS-only; config saved but daemon "
-                    "not installed. Use `cswap watch` to run it in the foreground."
-                ))
+        if args.once:
+            sys.exit(engine.tick().value)
 
-        elif args.subverb == "off":
-            config = _as_load_config(backup_root)
-            config = _replace(config, enabled=False)
-            _as_save_config(config, backup_root)
-
-            if Platform.detect() is Platform.MACOS:
-                msg = uninstall_agent()
-                print(msg)
-            else:
-                print(dimmed("Config saved (no daemon to uninstall — macOS only)."))
-
-        else:  # status (default)
-            config = _as_load_config(backup_root)
-            print(f"enabled:           {config.enabled}")
-            print(f"strategy:          {config.strategy}")
-            print(f"session_threshold: {config.session_threshold}%")
-            print(f"weekly_threshold:  {config.weekly_threshold}%")
-            print(f"notify:            {config.notify}")
-            print(f"poll interval:     {config.min_interval}s – {config.max_interval}s")
-            print(f"monitoring:        {_monitoring_status_line(backup_root)}")
-            last_switch = _last_switch_status_line(backup_root)
-            if last_switch is not None:
-                print(f"last switch:       {last_switch}")
-            usage_lines = _last_usage_status_lines(backup_root)
-            if usage_lines:
-                print("last-known usage:")
-                for line in usage_lines:
-                    print(line)
-
-            if Platform.detect() is Platform.MACOS:
-                print(f"agent:             {agent_status()}")
-            else:
-                print(dimmed("agent:             n/a (macOS only)"))
-
-    except Exception as exc:
-        error(f"Error: {exc}")
+        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
+        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        if not args.json:
+            print(
+                dimmed(
+                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"every {settings.interval_seconds:.0f}s"
+                    f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
+                )
+            )
+        sys.exit(engine.run_loop())
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Auto-switch stopped')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+
+def _config_command(argv: list[str]) -> None:
+    """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`
+    (same limitation: `config` must be the first argument). Edits
+    settings.json in the backup root with strict validation — unlike loading,
+    which forgivingly clamps — so a typo'd key or out-of-range value errors
+    loudly here instead of silently degrading at `cswap auto` time.
+    """
+    from claude_swap.settings import (
+        SETTING_SPECS,
+        effective_settings,
+        format_setting_value,
+        set_setting,
+        setting_spec,
+        settings_path,
+        unset_setting,
+    )
+
+    key_lines = "\n".join(
+        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        for spec in SETTING_SPECS.values()
+    )
+    parser = argparse.ArgumentParser(
+        prog="cswap config",
+        description=(
+            "Read and edit claude-swap settings (settings.json in the "
+            "backup root)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Keys:
+{key_lines}
+
+Examples:
+  cswap config                              # list effective settings
+  cswap config get autoswitch.threshold
+  cswap config set autoswitch.threshold 80
+  cswap config unset autoswitch.threshold   # back to the default
+  cswap config path                         # where settings.json lives
+        """,
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with list or get)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+
+    p_list = sub.add_parser("list", help="Show all effective settings (the default)")
+    p_get = sub.add_parser("get", help="Print one setting's effective value")
+    p_get.add_argument("key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold")
+    for p in (p_list, p_get):
+        # SUPPRESS: without it the subparser's False default would clobber a
+        # pre-verb `cswap config --json` in the shared namespace.
+        p.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Emit machine-readable JSON to stdout",
+        )
+    p_set = sub.add_parser("set", help="Validate and persist one setting")
+    p_set.add_argument("key", metavar="KEY")
+    p_set.add_argument("value", metavar="VALUE")
+    p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
+    p_unset.add_argument("key", metavar="KEY")
+    sub.add_parser("path", help="Print the settings.json location")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    action = args.action or "list"
+    if json_mode and action not in ("list", "get"):
+        parser.error("--json can only be used with list or get")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+        root = switcher.backup_dir
+
+        if action == "path":
+            print(settings_path(root))
+        elif action == "list":
+            rows = effective_settings(root)
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "path": str(settings_path(root)),
+                    "settings": [
+                        {"key": spec.dotted, "value": value, "isSet": is_set}
+                        for spec, value, is_set in rows
+                    ],
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                key_w = max(len(spec.dotted) for spec, _, _ in rows)
+                val_w = max(len(format_setting_value(v)) for _, v, _ in rows)
+                for spec, value, is_set in rows:
+                    line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
+                    print(line if is_set else f"{line}  {dimmed('(default)')}")
+        elif action == "get":
+            spec = setting_spec(args.key)
+            value, is_set = next(
+                (v, s) for sp, v, s in effective_settings(root) if sp is spec
+            )
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "key": spec.dotted,
+                    "value": value,
+                    "isSet": is_set,
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(format_setting_value(value))
+        elif action == "set":
+            value = set_setting(root, args.key, args.value)
+            print(f"{args.key} = {format_setting_value(value)}")
+        elif action == "unset":
+            if unset_setting(root, args.key):
+                default = setting_spec(args.key).default
+                print(f"{args.key} unset (default: {format_setting_value(default)})")
+            else:
+                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
+def _use_native_tls() -> None:
+    """Route TLS trust decisions through the OS-native verifier.
+
+    Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
+    chain. Python's stdlib ``ssl`` uses OpenSSL, which on Windows loads the
+    system cert store as a flat set and matches CA certs by *subject name*, so a
+    stale, expired duplicate of an intermediate (e.g. an old ``ISRG Root X2``
+    left in the user's store) can shadow the valid path and fail verification
+    with "certificate has expired" even though the served chain is valid — which
+    silently breaks inactive-account token refresh. The OS-native verifiers
+    (SChannel on Windows, SecureTransport on macOS) build the chain correctly
+    and don't trip on the expired duplicate — the same reason Claude Code (Node,
+    with its own bundled roots) is unaffected. ``truststore`` delegates to them.
+
+    Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
+    the CLI over a TLS-trust nicety.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
 
 
 def main() -> None:
     """Main entry point for the CLI."""
-    if len(sys.argv) > 1 and sys.argv[1] == "run":
-        _run_command(sys.argv[2:])
-        return  # only reachable in tests where exec/exit is mocked
+    _use_native_tls()
+    argv = sys.argv[1:]
 
-    if len(sys.argv) > 1 and sys.argv[1] in ("auto", "watch", "_auto-daemon"):
-        _auto_command(sys.argv[1:])
+    # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    if argv and argv[0] == "run":
+        _run_command(argv[1:])
+        return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "auto":
+        _auto_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        _config_command(sys.argv[2:])
         return
 
+    # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
+    # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
+    # the usage error, and `cswap tui` stays the explicit spelling.
+    if not argv and sys.stdout.isatty() and sys.stdin.isatty():
+        argv = ["--tui"]
+
+    # Memorable subcommands (`cswap switch <email>`, `cswap list`, `cswap help`, ...)
+    # are rewritten to the equivalent flags so the original `--flag` interface
+    # keeps working unchanged.
+    argv = _translate_subcommand(argv)
+
     parser = argparse.ArgumentParser(
+        prog=_prog_name(),
         description="Multi-Account Switcher for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s --add-account
-  %(prog)s --add-token sk-ant-oat01-...           # OAuth setup-token
-  %(prog)s --add-token sk-ant-api03-...           # managed API key
-  %(prog)s --add-token sk-ant-oat01-... --slot 3
-  %(prog)s --add-token sk-ant-oat01-... --email me@example.com
-  %(prog)s --add-token - --slot 3
-  %(prog)s --list
-  %(prog)s --switch
-  %(prog)s --switch --strategy best             # switch to the account with most quota left
-  %(prog)s --switch --strategy next-available   # rotate, skipping rate-limited accounts
-  %(prog)s --switch-to 2
-  %(prog)s --switch-to user@example.com
-  %(prog)s run 2                            # run account 2 in this terminal only
-  %(prog)s run 2 -- --resume                # forward args after '--' to claude
-  %(prog)s auto on                          # macOS: auto-switch accounts before you hit a limit
-  %(prog)s watch                            # run the auto-switcher in this terminal
-  %(prog)s --remove-account user@example.com
-  %(prog)s --status
-  %(prog)s --purge
-  %(prog)s --export backup.cswap
-  %(prog)s --import backup.cswap
-  %(prog)s --tui                              # interactive arrow-key menu
-  %(prog)s --upgrade                          # self-upgrade to latest version
+Commands:
+  %(prog)s help                       show this help
+  %(prog)s list                       list managed accounts
+  %(prog)s status                     show current account
+  %(prog)s switch                     rotate to the next account
+  %(prog)s switch <num|email>         switch to a specific account
+  %(prog)s add                        add the current account
+  %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s remove <num|email>         remove an account
+  %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
+  %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s export <path>              export accounts
+  %(prog)s import <path>              import accounts
+  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
+  %(prog)s watch                      dashboard, opened on the live watch page
+  %(prog)s upgrade                    self-upgrade to latest
+  %(prog)s purge                      remove all claude-swap data
+
+Aliases: ls=list  rm=remove  update=upgrade
+
+Flags combine with subcommands:
+  %(prog)s switch --strategy best           # pick the account with most quota left
+  %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch user@example.com
+  %(prog)s list --json
+  %(prog)s add --slot 3                      # add to a specific slot
+  %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
+  %(prog)s config set autoswitch.threshold 80
+
+The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
     )
 
@@ -445,7 +626,11 @@ Examples:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing accounts during import",
+        help=(
+            "Overwrite existing accounts during import; with --switch-to, "
+            "activate the stored credentials without backing up the current "
+            "login first"
+        ),
     )
     parser.add_argument(
         "--full",
@@ -503,7 +688,18 @@ Examples:
     group.add_argument(
         "--tui",
         action="store_true",
-        help="Launch interactive arrow-key menu (single-level)",
+        help=(
+            "Launch the interactive dashboard (usage bars, switching, live "
+            "auto view). Bare %(prog)s in a terminal opens it too."
+        ),
+    )
+    group.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "Open the interactive dashboard directly on the watch page: "
+            "every account in full detail, live"
+        ),
     )
     group.add_argument(
         "--upgrade",
@@ -522,7 +718,7 @@ Examples:
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
@@ -549,8 +745,8 @@ Examples:
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")
 
-    if args.force and not args.import_:
-        parser.error("--force can only be used with --import")
+    if args.force and not (args.import_ or args.switch_to):
+        parser.error("--force can only be used with --import or --switch-to")
 
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
@@ -600,7 +796,9 @@ Examples:
         elif args.switch:
             payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         elif args.switch_to:
-            payload = switcher.switch_to(args.switch_to, json_output=args.json)
+            payload = switcher.switch_to(
+                args.switch_to, json_output=args.json, force=args.force
+            )
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:
@@ -614,15 +812,13 @@ Examples:
 
             import_accounts(switcher, args.import_, force=args.force)
         elif args.tui:
-            try:
-                from claude_swap.tui import run as tui_run
-            except ImportError as e:
-                error(
-                    "TUI mode requires the 'curses' module. "
-                    "On Windows, install with: pip install windows-curses"
-                )
-                sys.exit(1)
+            from claude_swap.tui import run as tui_run
+
             sys.exit(tui_run(switcher))
+        elif args.watch:
+            from claude_swap.tui import run as tui_run
+
+            sys.exit(tui_run(switcher, start="watch"))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.

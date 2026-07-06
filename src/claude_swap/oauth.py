@@ -7,6 +7,7 @@ import logging
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
@@ -47,21 +48,41 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
+@dataclass(frozen=True)
+class RefreshOutcome:
+    """Result of a refresh-token grant attempt.
+
+    ``credentials`` is the full rotated credentials JSON on success, else None.
+    ``error`` classifies failures so callers can distinguish a dead refresh-token
+    lineage (permanent: quarantine, stop retrying) from a network blip
+    (transient: retry later):
+
+    - ``None`` — success (``credentials`` is set)
+    - ``"invalid_grant"`` — the token endpoint rejected the grant; this refresh
+      token is dead and re-login is required
+    - ``"no_refresh_token"`` — the stored credential carries no usable refresh
+      token (also permanent for retry purposes)
+    - ``"transient"`` — network/server error; the token may still be valid
+    """
+
+    credentials: str | None
+    error: str | None
+
+
+def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST."""
     try:
         data = json.loads(credentials)
-        oauth = data.get("claudeAiOauth")
-        if not isinstance(oauth, dict):
-            return None
+    except json.JSONDecodeError:
+        return RefreshOutcome(None, "no_refresh_token")
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return RefreshOutcome(None, "no_refresh_token")
 
-        refresh_token = oauth.get("refreshToken")
-        if not refresh_token:
-            return None
-
+    try:
         body = json.dumps({
             "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
+            "refresh_token": oauth["refreshToken"],
             "client_id": OAUTH_CLIENT_ID,
         }).encode()
 
@@ -86,14 +107,27 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             oauth["scopes"] = resp_data["scope"].split()
 
         data["claudeAiOauth"] = oauth
-        return json.dumps(data)
+        return RefreshOutcome(json.dumps(data), None)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
-        return None
+        # Permanent only when the server itself rejected the grant: a 4xx AND
+        # an explicit marker in the body. Anything ambiguous stays transient —
+        # a misclassified transient costs one retry, a misclassified permanent
+        # would wrongly quarantine a live token.
+        if e.code in (400, 401, 403) and (
+            "invalid_grant" in body or "invalid_client" in body
+        ):
+            return RefreshOutcome(None, "invalid_grant")
+        return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
-        return None
+        return RefreshOutcome(None, "transient")
+
+
+def refresh_oauth_credentials(credentials: str) -> str | None:
+    """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
+    return try_refresh_oauth_credentials(credentials).credentials
 
 
 
@@ -144,6 +178,26 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     return countdown, time_str
 
 
+def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
+    """``(countdown, clock)`` for one usage window, or None when unknown.
+
+    Recomputed from ``resets_at`` at render time: the strings cached at fetch
+    time drift as the measurement ages (a countdown frozen 2h ago overstates
+    the remaining wait by those 2h, and a same-day "15:30" clock silently
+    starts meaning yesterday). Entries persisted without ``resets_at`` fall
+    back to the fetch-time strings — stale beats blank.
+    """
+    resets_at = window.get("resets_at")
+    if resets_at:
+        try:
+            return format_reset(resets_at)
+        except (ValueError, TypeError):
+            pass  # unparseable cached value — fall back below
+    if "clock" in window:
+        return window.get("countdown", "?"), window["clock"]
+    return None
+
+
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
     url = "https://api.anthropic.com/api/oauth/usage"
@@ -155,6 +209,55 @@ def request_usage_data(access_token: str) -> dict:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
+
+
+def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
+    """Map a usage-fetch exception to ``(kind, retry_after_s)``.
+
+    ``kind`` is a short stable token for logs and backoff decisions
+    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
+    exception type name as a fallback). ``retry_after_s`` is the parsed
+    ``Retry-After`` header when the server sent one (seconds form only — the
+    HTTP-date form is rare enough to ignore).
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        retry_after = None
+        raw = e.headers.get("Retry-After") if e.headers else None
+        if raw:
+            try:
+                retry_after = max(0.0, float(raw.strip()))
+            except ValueError:
+                pass
+        return f"http-{e.code}", retry_after
+    if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
+        return "timeout", None
+    if isinstance(e, urllib.error.URLError):
+        if isinstance(e.reason, TimeoutError):
+            return "timeout", None
+        return "network", None
+    if isinstance(e, json.JSONDecodeError):
+        return "bad-response", None
+    return type(e).__name__, None
+
+
+def _log_usage_failure(
+    context: str, e: Exception, kind: str, retry_after_s: float | None = None
+) -> None:
+    """One WARNING line with the cause so it lands in the default log file
+    (issue #85 was undiagnosable with failures swallowed at DEBUG); the full
+    exception repr stays at DEBUG. The line is what users paste into public
+    issues, so ``context`` must not carry the email, and the server's
+    Retry-After rides along when present (it answers the backoff-tuning
+    question without a second ask)."""
+    where = f" {context}" if context else ""
+    cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
+    if kind == "http-429" and retry_after_s:
+        # The burst rule needs ~5 rapid requests on one account to trip; cswap
+        # sends at most one per account per pass, so state the verified fact
+        # and let the user look for the real poller.
+        cause += " (burst block — cswap's own polling cannot trigger this)"
+    _logger.warning("Usage fetch failed%s: %s", where, cause)
+    _logger.debug("Usage fetch failure detail%s: %r", where, e)
 
 
 
@@ -170,7 +273,6 @@ def build_usage_result(data: dict) -> dict | None:
         if h5.get("resets_at"):
             h5_entry["resets_at"] = h5["resets_at"]
             h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
-            h5_entry["resets_at"] = h5["resets_at"]
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
@@ -179,7 +281,6 @@ def build_usage_result(data: dict) -> dict | None:
         if d7.get("resets_at"):
             d7_entry["resets_at"] = d7["resets_at"]
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
-            d7_entry["resets_at"] = d7["resets_at"]
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")
@@ -202,15 +303,39 @@ def build_usage_result(data: dict) -> dict | None:
                 if eu.get("resets_at"):
                     spend_entry["resets_at"] = eu["resets_at"]
                     spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
-                    spend_entry["resets_at"] = eu["resets_at"]
                 result["spend"] = spend_entry
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
 
+    # Per-model weekly limits live in the newer ``limits`` array as
+    # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.
+    # "Fable"). The legacy five_hour/seven_day keys above never expose these, so
+    # surface each scoped window separately. Absent/older responses (no
+    # ``limits``) simply yield no ``scoped`` key.
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        scoped: list[dict] = []
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            scope = lim.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            name = model.get("display_name") if isinstance(model, dict) else None
+            pct = lim.get("percent")
+            if not name or not isinstance(pct, (int, float)):
+                continue
+            scoped_entry: dict = {"name": name, "pct": float(pct)}
+            if lim.get("resets_at"):
+                scoped_entry["resets_at"] = lim["resets_at"]
+                scoped_entry["countdown"], scoped_entry["clock"] = format_reset(lim["resets_at"])
+            scoped.append(scoped_entry)
+        if scoped:
+            result["scoped"] = scoped
+
     return result if result else None
 
 
-def account_headroom(usage: dict | str | None) -> float | None:
+def account_headroom(usage: dict | None) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
     Considers only the 5-hour and 7-day utilization windows — the two that
@@ -219,9 +344,6 @@ def account_headroom(usage: dict | str | None) -> float | None:
     *binding* window (``100 - max(pct)``), so ``<= 0`` means the account is at
     or over a limit. Returns ``None`` when usage is unavailable or carries no
     window data, which callers treat as "unknown" (never auto-skipped).
-
-    Accepts the full usage union (incl. the ``"no credentials"`` sentinel str);
-    the isinstance guard returns ``None`` for any non-dict.
     """
     if not isinstance(usage, dict):
         return None
@@ -235,66 +357,57 @@ def account_headroom(usage: dict | str | None) -> float | None:
     return 100.0 - max(pcts)
 
 
+@dataclass(frozen=True)
+class UsageOutcome:
+    """Result of a usage-API fetch attempt.
+
+    ``usage`` is the normalized usage dict on success (it can also be ``None``
+    on a successful round trip whose response carried no window data).
+    ``error`` is ``None`` on success, else a ``_classify_usage_error`` kind
+    (plus ``"no-access-token"`` / ``"refresh-failed"`` for pre-request
+    failures). ``retry_after_s`` carries the server's Retry-After when sent.
+    """
+
+    usage: dict | None
+    error: str | None = None
+    retry_after_s: float | None = None
+
+
 def fetch_usage(access_token: str) -> dict | None:
     """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
     try:
         data = request_usage_data(access_token)
         return build_usage_result(data)
     except Exception as e:
-        _logger.debug("Usage fetch failed: %r", e)
+        kind, _ = _classify_usage_error(e)
+        _log_usage_failure("", e, kind)
         return None
 
 
-def fetch_usage_for_account(
+def try_fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
-    allow_refresh: bool = True,
-) -> dict | None:
+) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
-
-    ``allow_refresh`` gates the inactive-account token refresh and MUST be False
-    for the background launchd daemon. An OAuth refresh rotates the one-time
-    refresh token server-side; if the rotated token cannot be persisted — the
-    Keychain is locked while the Mac is asleep under launchd, or (as the daemon
-    historically did) no persist callback is wired — the rotation is lost and
-    the account is bricked until re-login. Foreground paths (a switch,
-    ``cswap --list``) run in the user's unlocked session where persistence is
-    reliable, so they keep the default (True). When False, an expired inactive
-    token returns None (its last-known usage stands) instead of a doomed,
-    token-burning refresh.
     """
+    context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
-        return None
+        return UsageOutcome(None, error="no-access-token")
 
     working_credentials = credentials
 
-    inactive_expired = (
+    if (
         not is_active
-        and bool(oauth.get("refreshToken"))
+        and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
-    )
-
-    if inactive_expired and not allow_refresh:
-        # Background daemon: never rotate a refresh token we may be unable to
-        # persist (locked Keychain under launchd). Skip the doomed request too —
-        # an expired token only 401s. Last-known usage stands; a foreground
-        # path refreshes it later.
-        _logger.debug(
-            "Inactive account %s (%s): token expired but refresh is disabled "
-            "for this context (background daemon) — leaving last-known usage.",
-            account_num,
-            email,
-        )
-        return None
-
-    if inactive_expired:
+    ):
         refreshed = refresh_oauth_credentials(working_credentials)
         if refreshed:
             working_credentials = refreshed
@@ -304,39 +417,55 @@ def fetch_usage_for_account(
 
     try:
         data = request_usage_data(access_token)
-        return build_usage_result(data)
+        return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
-        _logger.debug("Usage fetch failed: %r", e)
+        kind, retry_after = _classify_usage_error(e)
         if (
             e.code != 401
             or is_active
-            or not allow_refresh
             or not oauth
             or not oauth.get("refreshToken")
         ):
-            return None
+            _log_usage_failure(context, e, kind, retry_after)
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
         # Retry once after refreshing on 401 (inactive accounts only).
         refreshed = refresh_oauth_credentials(working_credentials)
         if not refreshed:
-            return None
+            _log_usage_failure(context, e, kind)
+            return UsageOutcome(None, error="refresh-failed")
 
         working_credentials = refreshed
         _persist(persist_credentials, account_num, email, working_credentials)
         refreshed_oauth = extract_oauth_data(working_credentials)
         new_token = refreshed_oauth.get("accessToken") if refreshed_oauth else None
         if not new_token:
-            return None
+            return UsageOutcome(None, error="refresh-failed")
 
         try:
             data = request_usage_data(new_token)
-            return build_usage_result(data)
+            return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
-            _logger.debug("Usage fetch failed after refresh: %r", retry_error)
-            return None
+            kind, retry_after = _classify_usage_error(retry_error)
+            _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
-        _logger.debug("Usage fetch failed: %r", e)
-        return None
+        kind, retry_after = _classify_usage_error(e)
+        _log_usage_failure(context, e, kind, retry_after)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+
+
+def fetch_usage_for_account(
+    account_num: str,
+    email: str,
+    credentials: str,
+    is_active: bool,
+    persist_credentials: Callable[[str, str, str], None] | None = None,
+) -> dict | None:
+    """Usage dict or None (see try_fetch_usage_for_account for the cause)."""
+    return try_fetch_usage_for_account(
+        account_num, email, credentials, is_active, persist_credentials
+    ).usage
 
 
 def _persist(

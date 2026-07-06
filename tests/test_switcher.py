@@ -12,12 +12,15 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from claude_swap import macos_keychain
+from claude_swap import oauth
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
     ValidationError,
 )
+from claude_swap.usage_store import FetchRecord, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_credentials_path
@@ -27,6 +30,7 @@ from claude_swap.switcher import (
     ClaudeAccountSwitcher,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
+    _format_usage_lines,
 )
 
 
@@ -429,9 +433,7 @@ class TestStatusCache:
     def test_status_uses_cached_usage(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """A fresh cache entry for the active account skips the API call."""
-        from claude_swap.cache import write_cache
-
+        """A fresh store entry for the active account skips the API call."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -439,15 +441,17 @@ class TestStatusCache:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        cached_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
-                  "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
-        }
-        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={
+                "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"},
+            })},
+            {"1": ("test@example.com", "")},
+        )
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.status()
 
         mock_fetch.assert_not_called()
@@ -459,8 +463,6 @@ class TestStatusCache:
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
         """When Claude Code is running, fetch with is_active=True (never refresh live creds)."""
-        from claude_swap.cache import read_cache, MISSING
-
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -476,7 +478,8 @@ class TestStatusCache:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_active_cc_running", return_value=True), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result) as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.status()
 
         mock_fetch.assert_called_once()
@@ -485,17 +488,15 @@ class TestStatusCache:
         output = capsys.readouterr().out
         assert "10%" in output
 
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert cached["1"] == usage_result
+        entry = UsageStore(switcher.backup_dir / "cache").entries(
+            {"1": ("test@example.com", "")}
+        )["1"]
+        assert entry.last_good == usage_result
 
     def test_status_preserves_other_accounts_in_cache(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """A cache miss for the active account merges into existing entries instead of clobbering."""
-        from claude_swap.cache import read_cache, write_cache, MISSING
-
+        """Fetching the active account merges into the store without clobbering others."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -503,22 +504,26 @@ class TestStatusCache:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Cache has only account "2"; status() runs for account "1"
-        existing = {"2": {"five_hour": {"pct": 80}}}
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        write_cache(cache_path, existing)
+        # Store has only account "2"; status() runs for account "1"
+        store = UsageStore(switcher.backup_dir / "cache")
+        store.record(
+            {"2": FetchRecord(usage={"five_hour": {"pct": 80}})},
+            {"2": ("account2@example.com", "")},
+        )
 
         usage_result = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result):
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)):
             switcher.status()
 
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert cached["1"] == usage_result
-        assert cached["2"] == {"five_hour": {"pct": 80}}
+        entries = store.entries(
+            {"1": ("test@example.com", ""), "2": ("account2@example.com", "")}
+        )
+        assert entries["1"].last_good == usage_result
+        assert entries["2"].last_good == {"five_hour": {"pct": 80}}
 
 
 class TestListAccountsUsage:
@@ -631,14 +636,14 @@ class TestListAccountsUsage:
             # Simulate a refresh on the inactive account only.
             if not is_active and persist_credentials is not None:
                 persist_credentials(account_num, email, refreshed_creds)
-            return None
+            return oauth.UsageOutcome(None)
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=mock_fetch):
             switcher.list_accounts()
 
         # Live creds must never be written while Claude Code is running.
@@ -659,7 +664,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
              patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes"):
             switcher.list_accounts(show_token_status=True)
 
@@ -669,10 +674,7 @@ class TestListAccountsUsage:
     def test_list_uses_cached_usage(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """When a fresh usage cache exists, list_accounts skips API calls."""
-        import time
-        from claude_swap.cache import write_cache
-
+        """When fresh store entries exist, list_accounts skips API calls."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
@@ -681,31 +683,38 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Pre-populate cache with usage data for both accounts
-        cached_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
-                   "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
-            "2": {"five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
-                   "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"}},
-        }
-        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+        # Pre-populate the store with fresh usage data for both accounts
+        UsageStore(switcher.backup_dir / "cache").record(
+            {
+                "1": FetchRecord(usage={
+                    "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                    "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"},
+                }),
+                "2": FetchRecord(usage={
+                    "five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
+                    "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"},
+                }),
+            },
+            {"1": ("test@example.com", ""), "2": ("account2@example.com", "")},
+        )
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.list_accounts()
 
-        # API should NOT have been called — data came from cache
+        # API should NOT have been called — data came from the store
         mock_fetch.assert_not_called()
         output = capsys.readouterr().out
         assert "25%" in output
         assert "80%" in output
 
-    def test_list_ignores_cache_when_accounts_change(
+    def test_list_refetches_stale_entries(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """Cache is invalidated when the account set doesn't match."""
-        from claude_swap.cache import write_cache
+        """Entries older than the serve TTL are refetched, not served."""
+        import time as time_mod
 
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
@@ -715,25 +724,93 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Cache has only account "1" but the switcher has accounts "1" and "2"
-        cached_usage = {
-            "1": {"five_hour": {"pct": 25}},
-        }
-        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+        # Store has a 100s-old entry for account "1" (past SERVE_TTL_S) and
+        # nothing for "2" — both must be fetched live.
+        backdated = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 100
+        )
+        backdated.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25}})},
+            {"1": ("test@example.com", "")},
+        )
 
         usage_result = {
             "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result):
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
 
+        assert mock_fetch.call_count == 2
         output = capsys.readouterr().out
-        # Should show live data (10%), not cached data (25%)
+        # Should show live data (10%), not the stale 25%
         assert "10%" in output
+        assert "25%" not in output
+
+    def test_list_fetch_set_restricts_fetches(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """``fetch`` caps which accounts may be fetched (the TUI watch view's
+        adaptive set); the default ``None`` keeps every stale account eligible
+        (covered by test_list_refetches_stale_entries)."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        usage_result = {
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
+            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
+        }
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
+            switcher.list_accounts(fetch=set())
+        # Both accounts are stale (nothing stored) yet nobody may be fetched.
+        mock_fetch.assert_not_called()
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
+            switcher.list_accounts(fetch={"2"})
+        # Only the allowed slot is fetched.
+        assert mock_fetch.call_count == 1
+        assert mock_fetch.call_args.args[0] == "2"
+
+
+class TestUsageFetchStamps:
+    def test_stamps_reflect_store_without_fetching(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        assert switcher.usage_fetch_stamps() == {"1": None, "2": None}
+
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25}})},
+            {"1": ("account1@example.com", "")},
+        )
+        stamps = switcher.usage_fetch_stamps()
+        assert stamps["1"] is not None
+        assert stamps["2"] is None
 
 
 class TestActiveAccountRefresh:
@@ -772,17 +849,18 @@ class TestActiveAccountRefresh:
         def mock_fetch(account_num, email, credentials, is_active, persist_credentials):
             assert is_active is False  # no owner → refresh enabled
             persist_credentials(account_num, email, self._REFRESHED)
-            return usage_result
+            return oauth.UsageOutcome(usage_result)
 
         with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=mock_fetch):
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert result == usage_result
+        assert result.usage == usage_result
+        assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
         write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
 
@@ -798,11 +876,12 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None) as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert result == USAGE_TOKEN_EXPIRED
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        # Owned + locally expired → the request would just 401, so none is made.
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_live_session_blocks_refresh(
@@ -815,10 +894,13 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[4242]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None) as mock_fetch:
-            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        # Session owns the credential + token expired → sentinel, no request,
+        # and certainly no refresh write.
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_lineage_mismatch_skips_write_and_reports_token_expired(
@@ -836,18 +918,18 @@ class TestActiveAccountRefresh:
 
         def mock_fetch(account_num, email, credentials, is_active, persist_credentials):
             persist_credentials(account_num, email, self._REFRESHED)
-            return usage_result  # in-memory token would fetch fine...
+            return oauth.UsageOutcome(usage_result)  # in-memory token would fetch fine...
 
         with patch.object(switcher, "_read_credentials", return_value=live_changed), \
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=mock_fetch):
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         # ...but we discarded the rotated credential, so never show its usage.
-        assert result == USAGE_TOKEN_EXPIRED
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
         write_live.assert_not_called()
         write_backup.assert_not_called()
 
@@ -866,17 +948,17 @@ class TestActiveAccountRefresh:
                 persist_credentials(account_num, email, self._REFRESHED)
             except Exception:
                 pass
-            return usage_result  # refreshed in-memory token still fetches fine
+            return oauth.UsageOutcome(usage_result)  # refreshed in-memory token still fetches fine
 
         with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials", side_effect=OSError("disk full")), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=mock_fetch):
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert result == USAGE_TOKEN_EXPIRED
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
 
     def test_detection_failure_fails_closed(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -892,10 +974,13 @@ class TestActiveAccountRefresh:
              patch("claude_swap.switcher.get_running_instances", side_effect=OSError("boom")), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None) as mock_fetch:
-            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        # Fails closed: assumed owner + expired token → sentinel, no request,
+        # no refresh write.
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_refresh_network_call_does_not_hold_the_lock(
@@ -913,14 +998,14 @@ class TestActiveAccountRefresh:
             if lock_free_during_fetch["ok"]:
                 probe.release()
             persist_credentials(account_num, email, self._REFRESHED)
-            return {"five_hour": {"pct": 10}}
+            return oauth.UsageOutcome({"five_hour": {"pct": 10}})
 
         with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials"), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=mock_fetch):
             switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         assert lock_free_during_fetch["ok"] is True
@@ -932,9 +1017,9 @@ class TestActiveAccountRefresh:
         from claude_swap.json_output import USAGE_NO_CREDENTIALS
 
         switcher = self._switcher(sample_sequence_data)
-        with patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             result = switcher._fetch_active_usage("1", "test@example.com", "")
-        assert result == USAGE_NO_CREDENTIALS
+        assert result.sentinel == USAGE_NO_CREDENTIALS
         mock_fetch.assert_not_called()
 
     def test_list_renders_token_expired_line(
@@ -949,11 +1034,34 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
         output = capsys.readouterr().out
         assert "token expired — Claude Code refreshes the active account" in output
+
+    def test_expired_owned_sentinel_wins_over_stored_entry(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The owned+expired sentinel is derived statically, so a fresh store
+        entry (or a backoff/claim gate skipping the fetch) can't hide it."""
+        switcher = self._switcher(sample_sequence_data)
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
+            {"1": ("test@example.com", "")},
+        )
+        info = (1, "test@example.com", "", "", True, self._EXPIRED)
+
+        with patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            entry = switcher._collect_usage_entries([info])["1"]
+
+        assert entry.sentinel == USAGE_TOKEN_EXPIRED
+        assert entry.decision_value() == USAGE_TOKEN_EXPIRED
+        assert entry.last_good == {"five_hour": {"pct": 25.0}}  # last-seen kept
+        mock_fetch.assert_not_called()
 
 
 class TestPerformSwitchPostDisplay:
@@ -1555,6 +1663,142 @@ class TestPerformSwitchPostDisplay:
         assert config_path.read_text() == original_config_text
 
 
+class TestSwitchToSelfSlotAndForce:
+    """Issue #79: --switch-to onto the active account must not back up the
+    live credentials into the target slot (destroying a freshly imported
+    backup); --force is the explicit stored-backup → live recovery path."""
+
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    IMPORTED_1 = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-imported-1",
+            "refreshToken": "rt-imported-1",
+        },
+    })
+    LIVE_1 = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-live-1",
+            "refreshToken": "rt-live-1",
+        },
+    })
+
+    def _post_import_state(self, temp_home, sample_sequence_data):
+        """Accounts 1 (active, live) & 2, with slot 1's stored backup holding
+        freshly imported credentials that differ from the (stale) live ones."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.platform = Platform.LINUX
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(self.LIVE_1)
+
+        creds_store = {
+            ("1", "test@example.com"): self.IMPORTED_1,
+            ("2", "account2@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "sk-2",
+                    "refreshToken": "rt-2",
+                },
+            }),
+        }
+        configs_store = {
+            ("1", "test@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "test@example.com",
+                    "accountUuid": "test-uuid-1234",
+                },
+            }),
+            ("2", "account2@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "account2@example.com",
+                    "accountUuid": "uuid-2",
+                },
+            }),
+        }
+        live_state = {"creds": self.LIVE_1}
+        return switcher, creds_store, configs_store, live_state
+
+    def test_switch_to_current_slot_is_noop_preserving_backup(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """Human-mode self-switch neither poisons the stored backup nor
+        rewrites the live credentials. Against main this fails: the switch
+        backed up the live creds into slot 1 before reading them back."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result is None
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        assert live["creds"] == self.LIVE_1
+        out = capsys.readouterr().out
+        assert "Already on" in out and "Account-1" in out
+        assert "cswap --switch-to 1 --force" in out
+
+    def test_force_self_activation_restores_imported_creds(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """--switch-to 1 --force rewrites the live login from the stored
+        backup without backing up the stale live creds first."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1", force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result is None
+        assert live["creds"] == self.IMPORTED_1
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert "Activated" in capsys.readouterr().out
+
+    def test_force_cross_slot_skips_backup_of_current(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """--switch-to 2 --force lands on account 2 without writing the stale
+        live creds into slot 1's freshly imported backup."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            switcher.switch_to("2", force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 2
+
+
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
 
 class TestAccountInfoOrgFields:
@@ -1823,7 +2067,7 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -1850,7 +2094,7 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -1881,7 +2125,7 @@ class TestBackwardCompatibility:
         (temp_home / ".claude" / ".credentials.json").write_text('{"accessToken": "tok"}')
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -1961,7 +2205,7 @@ class TestUpgradeMigration:
         )
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -3140,6 +3384,70 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestClaudeCodeLockCooperation:
+    """_perform_switch must hold Claude Code's own advisory locks
+    (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,
+    and fail cleanly — before any mutation — when Claude Code holds them."""
+
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
+
+    def test_switch_holds_both_cc_locks_at_write_time(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        creds_lock = temp_home / ".claude.lock"
+        config_lock = temp_home / ".claude.json.lock"
+        seen: list[tuple[bool, bool]] = []
+        original_write = s._write_credentials
+
+        def spying_write(credentials: str) -> None:
+            seen.append((creds_lock.is_dir(), config_lock.is_dir()))
+            original_write(credentials)
+
+        with patch.object(s, "_write_credentials", side_effect=spying_write), \
+             patch.object(s, "list_accounts"):
+            s.switch_to("2")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert seen and all(pair == (True, True) for pair in seen)
+        # Released after the switch.
+        assert not creds_lock.exists()
+        assert not config_lock.exists()
+
+    def test_preheld_cc_lock_fails_cleanly_without_mutation(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import claude_locks
+        from claude_swap.exceptions import ClaudeCodeLockTimeout
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        (temp_home / ".claude.lock").mkdir()  # fresh mtime = live CC refresh
+
+        live_creds_before = (
+            temp_home / ".claude" / ".credentials.json"
+        ).read_text()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            s.switch_to("2")
+
+        # Nothing was mutated: locks acquire before any write.
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        live_creds_after = (
+            temp_home / ".claude" / ".credentials.json"
+        ).read_text()
+        assert live_creds_after == live_creds_before
+        # The holder's lock was left alone.
+        assert (temp_home / ".claude.lock").is_dir()
+
+
 class TestMacosKeychainFallback:
     """macOS auto-fallback to file storage when the Keychain is unusable, plus the
     ``.enc``-wins backup reconciliation.
@@ -3362,17 +3670,75 @@ class TestMacosKeychainFallback:
         assert get_credentials_path().read_text() == '{"fresh":1}'
         assert (CLAUDE_CODE_KEYCHAIN_SERVICE, acct) not in block_real_keychain.data
 
-    def test_keychain_write_leaves_existing_file_untouched(
+    def test_keychain_write_refreshes_existing_file(
         self, temp_home: Path, block_real_keychain
     ):
-        # #1414: cswap must not delete a plaintext file it can't prove is its own.
+        # #86: an already-present shadow file must be rewritten (mtime bumped) so a
+        # running Claude Code session invalidates its memoized token and hot-reloads.
+        # #1414: it is rewritten, never deleted — a file-reading consumer stays valid.
         s = self._macos_switcher()
         cred = get_credentials_path()
         cred.parent.mkdir(parents=True, exist_ok=True)
-        cred.write_text("PRESERVE-ME")
+        cred.write_text("OLD-CREDS")
+        os.utime(cred, (1_000_000_000, 1_000_000_000))  # force an old mtime
+        old_mtime_ns = cred.stat().st_mtime_ns
+
         s._write_credentials('{"fresh":1}')  # keychain usable → writes keychain
+
         assert s._last_active_credentials_backend == "keychain"
-        assert cred.read_text() == "PRESERVE-ME"
+        assert cred.exists()  # never deleted (#1414)
+        assert cred.read_text() == '{"fresh":1}'  # rewritten to the fresh account
+        assert cred.stat().st_mtime_ns > old_mtime_ns  # the actual invalidation trigger
+
+    def test_keychain_write_bumps_mtime_even_when_content_unchanged(
+        self, temp_home: Path, block_real_keychain
+    ):
+        # The fix bumps mtime via atomic os.replace, so it fires even when the new
+        # creds are byte-identical to the old — the purest test of the mechanism
+        # (a content-only assertion would silently miss this).
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text('{"same":1}')
+        os.utime(cred, (1_000_000_000, 1_000_000_000))
+        old_mtime_ns = cred.stat().st_mtime_ns
+
+        s._write_credentials('{"same":1}')  # identical content
+
+        assert cred.stat().st_mtime_ns > old_mtime_ns
+
+    def test_keychain_write_does_not_create_absent_file(
+        self, temp_home: Path, block_real_keychain
+    ):
+        # Keychain-only users keep their fileless posture: no .credentials.json is
+        # created, so no plaintext credential lands on their disk (#86).
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        assert not cred.exists()
+
+        s._write_credentials('{"fresh":1}')  # keychain usable → writes keychain
+
+        assert s._last_active_credentials_backend == "keychain"
+        assert not cred.exists()
+
+    def test_refresh_stale_file_is_best_effort(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        # The Keychain write is authoritative and already succeeded; a failure to
+        # refresh the shadow file must warn, not fail the switch.
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("OLD-CREDS")
+
+        def boom(_credentials):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(s._store, "_write_active_credentials_file", boom)
+
+        s._write_credentials('{"fresh":1}')  # must not raise
+
+        assert s._last_active_credentials_backend == "keychain"
 
     # -- backup store: .enc-wins -----------------------------------------
 
@@ -3485,3 +3851,124 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+class TestFormatUsageLines:
+    """Test _format_usage_lines rendering, including per-model scoped windows."""
+
+    def test_scoped_lines_render_per_model_with_at_limit_marker(self):
+        usage = {
+            "five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0, "clock": "21:59", "countdown": "3h"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "clock": "21:59", "countdown": "3h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0].startswith("5h:")
+        assert lines[1].startswith("7d:")
+        fable = lines[2]
+        assert fable.startswith("Fable:")
+        assert "100%" in fable
+        assert fable.rstrip().endswith("(!)")  # at/over limit marker
+
+    def test_scoped_under_limit_has_no_marker(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 40.0, "clock": "21:59", "countdown": "3h"}]}
+        lines = _format_usage_lines(usage)
+        assert len(lines) == 1
+        assert lines[0].startswith("Fable:")
+        assert "40%" in lines[0]
+        assert "resets 21:59" in lines[0]
+        assert "in 3h" in lines[0]
+        assert not lines[0].rstrip().endswith("(!)")
+
+    def test_scoped_without_clock_renders_pct_only(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
+        lines = _format_usage_lines(usage)
+        assert lines == ["Fable: 100%  (!)"]
+
+    def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
+        # A measurement served from the store hours after its fetch still
+        # carries the countdown frozen at fetch time; rendering must derive
+        # the live value from resets_at instead (issue: "resets 15:59 in 17h"
+        # printed when the reset was 15h away).
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": resets_at,
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "in 2h" in line
+        assert "17h" not in line
+
+    def test_reset_falls_back_to_cached_strings_without_resets_at(self):
+        # Entries persisted by older versions have no resets_at — the
+        # fetch-time strings are the best available then.
+        usage = {"seven_day": {"pct": 62.0, "clock": "15:59", "countdown": "17h 0m"}}
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_reset_falls_back_on_unparseable_resets_at(self):
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": "not-a-date",
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_spend_clock_recomputed_from_resets_at(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        resets_at = (now + timedelta(hours=2)).isoformat()
+        expected_clock = oauth.format_reset(resets_at)[1]
+        usage = {
+            "spend": {
+                "used": 1.0,
+                "limit": 10.0,
+                "pct": 10.0,
+                "currency": "USD",
+                "resets_at": resets_at,
+                "clock": "stale-clock",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert f"resets {expected_clock}" in line
+        assert "stale-clock" not in line
+
+    def test_no_scoped_key_renders_only_standard_windows(self):
+        usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
+        lines = _format_usage_lines(usage)
+        assert all(not line.startswith("Fable:") for line in lines)
+
+    def test_scoped_labels_align_columns_with_standard_windows(self):
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 62.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        # Labels are padded to the widest ("Fable:"), so the % column lines up.
+        assert lines[0] == "5h:      0%"
+        assert lines[1].startswith("7d:     62%   resets Jul 5 08:59")
+        assert lines[2].startswith("Fable: 100%   resets Jul 5 08:59")
+        assert len({line.index("%") for line in lines}) == 1
+
+    def test_standard_windows_alone_keep_legacy_layout(self):
+        usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
+        lines = _format_usage_lines(usage)
+        assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
